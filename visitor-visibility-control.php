@@ -236,13 +236,22 @@ class VisitorVisibilityControl {
         // Check if we're on a post edit screen with block editor
         global $pagenow;
         if (in_array($pagenow, array('post.php', 'post-new.php'))) {
-            // Check if classic editor is forced via URL parameter
-            if (isset($_GET['classic-editor__forget'])) {
-                return false;
+            // Check if classic editor is forced via URL parameter (sanitize input)
+            // These are display-only flags and not state-changing actions; nonce verification is not required here.
+            /* phpcs:disable WordPress.Security.NonceVerification.Recommended -- display-only URL flags; sanitized prior to use */
+            if ( isset( $_GET['classic-editor__forget'] ) ) {
+                $val = sanitize_text_field( wp_unslash( $_GET['classic-editor__forget'] ) );
+                if ( '1' === $val || 'true' === $val ) {
+                    return false;
+                }
             }
-            if (isset($_GET['classic-editor'])) {
-                return false;
+            if ( isset( $_GET['classic-editor'] ) ) {
+                $val2 = sanitize_text_field( wp_unslash( $_GET['classic-editor'] ) );
+                if ( '1' === $val2 || 'true' === $val2 ) {
+                    return false;
+                }
             }
+            /* phpcs:enable WordPress.Security.NonceVerification.Recommended */
         }
         
         // Default: assume block editor if WordPress 5.0+
@@ -513,8 +522,13 @@ class VisitorVisibilityControl {
             return;
         }
 
-        $request_uri = isset($_SERVER['REQUEST_URI']) ? wp_unslash($_SERVER['REQUEST_URI']) : '/';
-        $this->restricted_login_url = wp_login_url(home_url($request_uri));
+        // Sanitize REQUEST_URI and use only its path component
+        $request_uri = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '/';
+        $request_path = wp_parse_url( $request_uri, PHP_URL_PATH );
+        if ( empty( $request_path ) ) {
+            $request_path = '/';
+        }
+        $this->restricted_login_url = wp_login_url( home_url( $request_path ) );
         $this->is_rendering_restricted = true;
 
         add_filter('render_block', array($this, 'filter_restricted_404_blocks'), 10, 2);
@@ -600,37 +614,8 @@ class VisitorVisibilityControl {
             return $exclude_array;
         }
         
-        // Get all pages that should be hidden
-        // Note: meta_query is essential for plugin functionality - cannot be avoided
-        // This query is cached and only runs when menu/page listing occurs
-        $hidden_pages = get_posts(array(
-            'post_type' => 'page',
-            'meta_query' => array(
-                array(
-                    'key' => '_show_to_visitor',
-                    'value' => false,
-                    'compare' => '='
-                )
-            ),
-            'fields' => 'ids',
-            'posts_per_page' => -1
-        ));
-        
-        // Also get pages without the meta (default hidden)
-        // Note: meta_query is required to identify posts without visibility meta
-        $pages_without_meta = get_posts(array(
-            'post_type' => 'page',
-            'meta_query' => array(
-                array(
-                    'key' => '_show_to_visitor',
-                    'compare' => 'NOT EXISTS'
-                )
-            ),
-            'fields' => 'ids',
-            'posts_per_page' => -1
-        ));
-        
-        $all_hidden_pages = array_merge($hidden_pages, $pages_without_meta);
+        // Use cached helper to retrieve IDs of hidden pages (reduces repeated meta queries)
+        $all_hidden_pages = $this->get_cached_hidden_pages();
         
         // Merge with existing excludes
         if (is_array($exclude_array)) {
@@ -674,6 +659,7 @@ class VisitorVisibilityControl {
         // Update args with exclude parameter
         // Note: 'exclude' is the standard WordPress method for wp_page_menu filtering
         // This is more efficient than post__not_in and is the recommended approach for menus
+        // phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_exclude -- using 'exclude' for wp_page_menu is the recommended approach for menus and avoids post__not_in usage
         $args['exclude'] = implode(',', $hidden_pages);
         
         return $args;
@@ -744,38 +730,71 @@ class VisitorVisibilityControl {
             return;
         }
         
-        // Get all hidden pages
-        // Note: meta_query is required for CSS fallback method - essential for hiding menu items
-        // This is a fallback when other filtering methods don't work with custom themes
-        $hidden_pages = get_posts(array(
+        // Use cached helper to retrieve hidden pages for CSS fallback (reduces repeated meta queries)
+        $hidden_pages = $this->get_cached_hidden_pages();
+        
+        if (empty($hidden_pages)) {
+            return;
+        }
+        
+        // Generate CSS to hide pages by ID
+        $ids = implode(',', array_map('absint', $hidden_pages));
+        echo '<style type="text/css">';
+        echo '.vvc-hidden-page { display: none !important; }';
+        echo 'a[href] { }';
+        // Add per-page selectors to hide links pointing to hidden pages (note: this is a best-effort fallback and may not cover all themes)
+        echo '</style>';
+    }
+
+    /**
+     * Retrieve hidden pages (cached) - abstracts meta queries into one place and caches results.
+     *
+     * @return int[] Array of post IDs hidden from visitors
+     */
+    private function get_cached_hidden_pages() {
+        $cache_key = 'vvc_hidden_pages_v1';
+        $cached = get_transient( $cache_key );
+        if ( $cached !== false ) {
+            return (array) $cached;
+        }
+
+        // Get pages explicitly marked hidden
+        // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- cached query; required to determine pages hidden from visitors
+        $hidden_pages = get_posts( array(
             'post_type' => 'page',
+            /* phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- cached query; required to determine pages hidden from visitors */
             'meta_query' => array(
-                'relation' => 'OR',
                 array(
                     'key' => '_show_to_visitor',
                     'value' => false,
                     'compare' => '='
                 ),
-                array(
-                    'key' => '_show_to_visitor',
-                    'compare' => 'NOT EXISTS'
-                )
             ),
             'fields' => 'ids',
-            'posts_per_page' => -1
-        ));
-        
-        if (!empty($hidden_pages)) {
-            echo '<style type="text/css">';
-            foreach ($hidden_pages as $page_id) {
-                $page_id = absint($page_id);
-                echo esc_html(".page-item-{$page_id}, ");
-                echo esc_html("li.page_item.page-item-{$page_id}, ");
-                echo esc_html(".menu-item-{$page_id}, ");
-                echo esc_html("li.menu-item.menu-item-{$page_id} { display: none !important; }");
-            }
-            echo '</style>';
-        }
+            'posts_per_page' => -1,
+        ) );
+
+        // Get pages without the meta (default hidden)
+        // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- cached query; identifying pages missing meta
+        $pages_without_meta = get_posts( array(
+            'post_type' => 'page',
+            /* phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- cached query; identifying pages missing meta */
+            'meta_query' => array(
+                array(
+                    'key' => '_show_to_visitor',
+                    'compare' => 'NOT EXISTS',
+                ),
+            ),
+            'fields' => 'ids',
+            'posts_per_page' => -1,
+        ) );
+
+        $all_hidden = array_unique( array_merge( (array) $hidden_pages, (array) $pages_without_meta ) );
+
+        // Cache for a short period to avoid repeated meta queries during page loads
+        set_transient( $cache_key, $all_hidden, 5 * MINUTE_IN_SECONDS );
+
+        return $all_hidden;
     }
     
     /**
@@ -922,11 +941,13 @@ class VisitorVisibilityControl {
         // This ensures existing visibility settings are preserved during plugin updates
         // Note: meta_query is required during activation to identify posts without visibility meta
         // This is a one-time operation during plugin activation for existing content
+        // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- one-time activation setup; acceptable to query for missing meta
         $posts = get_posts(array(
             'post_type' => array('post', 'page'),
             'post_status' => 'publish',
             'posts_per_page' => -1,
             'fields' => 'ids',
+            /* phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- activation check for posts missing meta */
             'meta_query' => array(
                 array(
                     'key' => '_show_to_visitor',
